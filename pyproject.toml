@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torched-mountainsort5"
+version = "0.1.0"
+description = "GPU-accelerated MountainSort5 spike sorting pipeline built on PyTorch"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+spikeinterface = [
+    "spikeinterface",
+]
+benchmark = [
+    "spikeinterface",
+    "mountainsort5",
+    "scipy",
+    "probeinterface",
+]
+test = [
+    "pytest",
+    "spikeinterface",
+    "mountainsort5",
+]
+
+[tool.setuptools.packages.find]
+include = ["torched_mountainsort5*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

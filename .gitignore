@@ -1,0 +1,26 @@
+# Virtual Environment
+.venv_torch_ms5/
+venv/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build and Distribution
+build/
+dist/
+*.egg-info/
+
+# IDE Settings
+.vscode/
+.idea/
+
+# Tool-specific
+.claude/
+
+# OS-specific
+Thumbs.db
+.DS_Store
