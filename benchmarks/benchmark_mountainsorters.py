@@ -1,10 +1,12 @@
 """
-Triple-target MountainSort5 benchmark.
+MountainSort5 benchmark.
 
-Compares three execution paths at identical 4-stage boundaries:
+Compares five execution paths at identical 4-stage boundaries:
   - Original MS5 (CPU):  low-level NumPy functions called directly
   - Torched MS5 (CPU):   nn.Module pipeline with device='cpu'
   - Torched MS5 (GPU):   nn.Module pipeline with device='cuda'
+  - Optim MS5 (CPU):     nn.Module pipeline with PyTorch-native ISO-SPLIT, device='cpu'
+  - Optim MS5 (GPU):     nn.Module pipeline with PyTorch-native ISO-SPLIT, device='cuda'
 
 Stages:
   A  Detection & Extraction   (detect_spikes, remove_duplicates, extract_snippets)
@@ -49,6 +51,7 @@ except ImportError:
     HAS_CUDA = False
 
 STAGE_NAMES = ["A_detection", "B_clustering", "C_alignment", "D_postprocessing"]
+ALL_TARGETS = ["original_cpu", "torched_cpu", "torched_gpu", "optim_cpu", "optim_gpu"]
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +66,7 @@ class BenchmarkConfig:
     chan_map_path: Path = Path(r"D:\chanMap.mat")
     results_dir: Path = Path("results")
     n_runs: int = 3
-    targets: List[str] = field(default_factory=lambda: ["original_cpu", "torched_cpu", "torched_gpu"])
+    targets: List[str] = field(default_factory=lambda: ALL_TARGETS)
     scheme1_params: ms5.Scheme1SortingParameters = field(default_factory=lambda: ms5.Scheme1SortingParameters(
         detect_channel_radius=150,
         detect_threshold=5.5,
@@ -131,7 +134,7 @@ def load_and_preprocess(cfg: BenchmarkConfig) -> Tuple[si.BaseRecording, np.ndar
     # --- NEW: Slice the recording for development ---
     # Example 1: Grab the first 32 channels
     chan_range = range(155, 167)  # 155:167
-    channels_to_keep = recording.get_channel_ids()[:]   # Adjust this range as needed for testing
+    channels_to_keep = recording.get_channel_ids()[chan_range]   # Adjust this range as needed for testing
     
     # Example 2: Grab specific channel IDs (if you know where a good unit is)
     # channels_to_keep = [10, 11, 12, 13, 14, 15] 
@@ -248,20 +251,9 @@ def run_original_cpu(
 # ---------------------------------------------------------------------------
 # Runner:  Torched (CPU or GPU)  – calls nn.Module stages directly
 # ---------------------------------------------------------------------------
-def run_torched(
-    traces_master: np.ndarray,
-    channel_locations: np.ndarray,
-    sampling_frequency: float,
-    params: ms5.Scheme1SortingParameters,
-    device: str,
-) -> Tuple[RunTimings, np.ndarray, np.ndarray]:
-    from torched_mountainsort5.schema import SortingBatch, SortingParameters
-    from torched_mountainsort5.mountainsort5 import MountainSort5
-
-    dev = torch.device(device)
-    use_cuda_sync = dev.type == "cuda"
-
-    torched_params = SortingParameters(
+def _make_torched_params(params: ms5.Scheme1SortingParameters):
+    from torched_mountainsort5.schema import SortingParameters
+    return SortingParameters(
         detect_threshold=params.detect_threshold,
         detect_channel_radius=params.detect_channel_radius,
         detect_time_radius_msec=params.detect_time_radius_msec,
@@ -273,7 +265,26 @@ def run_torched(
         npca_per_subdivision=params.npca_per_subdivision,
         skip_alignment=params.skip_alignment,
     )
-    model = MountainSort5(torched_params, sampling_frequency).to(dev)
+
+
+def run_torched(
+    traces_master: np.ndarray,
+    channel_locations: np.ndarray,
+    sampling_frequency: float,
+    params: ms5.Scheme1SortingParameters,
+    device: str,
+    use_optim: bool = False,
+) -> Tuple[RunTimings, np.ndarray, np.ndarray]:
+    from torched_mountainsort5.schema import SortingBatch
+    from torched_mountainsort5.mountainsort5 import MountainSort5
+    from torched_mountainsort5.torch_clustering_mountainsort5 import TorchClusteringMountainSort5
+
+    dev = torch.device(device)
+    use_cuda_sync = dev.type == "cuda"
+
+    torched_params = _make_torched_params(params)
+    model_cls = TorchClusteringMountainSort5 if use_optim else MountainSort5
+    model = model_cls(torched_params, sampling_frequency).to(dev)
 
     traces_t = torch.as_tensor(np.copy(traces_master), dtype=torch.float32, device=dev)
     chan_locs_t = torch.as_tensor(channel_locations.copy(), dtype=torch.float32, device=dev)
@@ -352,9 +363,10 @@ def run_target(
     all_labels: List[np.ndarray] = []
 
     # CUDA warm-up (one throw-away run)
-    if target == "torched_gpu":
+    if target in ("torched_gpu", "optim_gpu"):
+        use_optim = target == "optim_gpu"
         print("  CUDA warm-up run ...")
-        run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda")
+        run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda", use_optim=use_optim)
         torch.cuda.empty_cache()
 
     for i in range(cfg.n_runs):
@@ -370,6 +382,10 @@ def run_target(
             timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu")
         elif target == "torched_gpu":
             timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda")
+        elif target == "optim_cpu":
+            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu", use_optim=True)
+        elif target == "optim_gpu":
+            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda", use_optim=True)
         else:
             raise ValueError(f"Unknown target: {target}")
 
@@ -430,6 +446,9 @@ def fidelity_check(
         ("original_cpu", "torched_cpu"),
         ("original_cpu", "torched_gpu"),
         ("torched_cpu", "torched_gpu"),
+        ("torched_cpu", "optim_cpu"),
+        ("torched_gpu", "optim_gpu"),
+        ("optim_cpu", "optim_gpu"),
     ]
     for t1, t2 in pairs:
         if t1 not in results or t2 not in results:
@@ -501,8 +520,8 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument(
         "--targets",
         nargs="+",
-        default=["original_cpu", "torched_cpu", "torched_gpu"],
-        choices=["original_cpu", "torched_cpu", "torched_gpu"],
+        default=ALL_TARGETS,
+        choices=ALL_TARGETS,
         help="Which targets to benchmark",
     )
     args = parser.parse_args()
@@ -519,12 +538,14 @@ def main():
     cfg = parse_args()
 
     # Validate targets
-    if "torched_gpu" in cfg.targets and not HAS_CUDA:
-        print("WARNING: torched_gpu requested but CUDA not available. Removing from targets.")
-        cfg.targets = [t for t in cfg.targets if t != "torched_gpu"]
-    if any(t.startswith("torched") for t in cfg.targets) and not HAS_TORCH:
-        print("WARNING: torched targets requested but torch not installed. Removing.")
-        cfg.targets = [t for t in cfg.targets if not t.startswith("torched")]
+    gpu_targets = {"torched_gpu", "optim_gpu"}
+    torch_targets = {"torched_cpu", "torched_gpu", "optim_cpu", "optim_gpu"}
+    if gpu_targets & set(cfg.targets) and not HAS_CUDA:
+        print("WARNING: GPU targets requested but CUDA not available. Removing from targets.")
+        cfg.targets = [t for t in cfg.targets if t not in gpu_targets]
+    if torch_targets & set(cfg.targets) and not HAS_TORCH:
+        print("WARNING: torch-based targets requested but torch not installed. Removing.")
+        cfg.targets = [t for t in cfg.targets if t not in torch_targets]
 
     if not cfg.targets:
         print("No valid targets remaining. Exiting.")
@@ -543,7 +564,7 @@ def main():
         print(f"  TARGET: {target}  ({cfg.n_runs} runs)")
         print(f"{'=' * 60}")
 
-        if target.startswith("torched"):
+        if target in torch_targets:
             torch.cuda.empty_cache() if HAS_CUDA else None
 
         timings, all_times, all_labels = run_target(
