@@ -62,7 +62,7 @@ class BenchmarkConfig:
     sampling_freq: int = 30000
     num_channels: int = 384
     dtype: str = "int16"
-    npx_bin_path: Path = Path(r"C:\Users\juway\Documents\Marquees-smith\c46\subset_data\raw_1pct.bin")
+    npx_bin_path: Path = Path(r"C:\Users\juway\Documents\Marquees-smith\c46\subset_data\raw_2pct.bin")
     chan_map_path: Path = Path(r"D:\chanMap.mat")
     results_dir: Path = Path("results")
     n_runs: int = 3
@@ -277,13 +277,13 @@ def run_torched(
 ) -> Tuple[RunTimings, np.ndarray, np.ndarray]:
     from torched_mountainsort5.schema import SortingBatch
     from torched_mountainsort5.mountainsort5 import MountainSort5
-    from torched_mountainsort5.torch_clustering_mountainsort5 import TorchClusteringMountainSort5
+    from torched_mountainsort5.torch_clustering_mountainsort5 import TorchIsosplit6MountainSort5
 
     dev = torch.device(device)
     use_cuda_sync = dev.type == "cuda"
 
     torched_params = _make_torched_params(params)
-    model_cls = TorchClusteringMountainSort5 if use_optim else MountainSort5
+    model_cls = TorchIsosplit6MountainSort5 if use_optim else MountainSort5
     model = model_cls(torched_params, sampling_frequency).to(dev)
 
     traces_t = torch.as_tensor(np.copy(traces_master), dtype=torch.float32, device=dev)
@@ -445,10 +445,8 @@ def fidelity_check(
     pairs = [
         ("original_cpu", "torched_cpu"),
         ("original_cpu", "torched_gpu"),
-        ("torched_cpu", "torched_gpu"),
-        ("torched_cpu", "optim_cpu"),
-        ("torched_gpu", "optim_gpu"),
-        ("optim_cpu", "optim_gpu"),
+        ("original_cpu", "optim_cpu"),
+        ("original_cpu", "optim_gpu"),
     ]
     for t1, t2 in pairs:
         if t1 not in results or t2 not in results:
@@ -513,7 +511,7 @@ def save_json_report(
 # ---------------------------------------------------------------------------
 def parse_args() -> BenchmarkConfig:
     parser = argparse.ArgumentParser(description="Triple-target MountainSort5 benchmark")
-    parser.add_argument("-n", "--n-runs", type=int, default=1, help="Number of timed runs per target")
+    parser.add_argument("-n", "--n-runs", type=int, default=3, help="Number of timed runs per target")
     parser.add_argument("--npx-bin", type=Path, help="Path to raw .bin recording")
     parser.add_argument("--chan-map", type=Path, help="Path to chanMap.mat")
     parser.add_argument("--results-dir", type=Path, default=Path("results"), help="Output directory")
