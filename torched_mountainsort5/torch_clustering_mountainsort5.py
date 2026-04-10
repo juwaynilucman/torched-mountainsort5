@@ -48,7 +48,7 @@ class _TorchIsosplit6Adapter(nn.Module):
         return batch
 
 
-class TorchClusteringMountainSort5(nn.Module):
+class TorchIsosplit6MountainSort5(nn.Module):
     """Top-level orchestrator for the MountainSort5 sorting pipeline.
 
     This variant uses the pure-PyTorch ISO-SPLIT clustering algorithm from
