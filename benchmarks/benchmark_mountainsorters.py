@@ -2,11 +2,11 @@
 MountainSort5 benchmark.
 
 Compares five execution paths at identical 4-stage boundaries:
-  - Original MS5 (CPU):  low-level NumPy functions called directly
-  - Torched MS5 (CPU):   nn.Module pipeline with device='cpu'
-  - Torched MS5 (GPU):   nn.Module pipeline with device='cuda'
-  - Optim MS5 (CPU):     nn.Module pipeline with PyTorch-native ISO-SPLIT, device='cpu'
-  - Optim MS5 (GPU):     nn.Module pipeline with PyTorch-native ISO-SPLIT, device='cuda'
+  - original:       Original MountainSort5 (low-level NumPy functions called directly)
+  - cpp_iso_cpu:    PyTorched MountainSort5 with C++ isosplit6 (CPU)
+  - cpp_iso_gpu:    PyTorched MountainSort5 with C++ isosplit6 (GPU)
+  - torch_iso_cpu:  PyTorched MountainSort5 with PyTorch isosplit6 (CPU)
+  - torch_iso_gpu:  PyTorched MountainSort5 with PyTorch isosplit6 (GPU)
 
 Stages:
   A  Detection & Extraction   (detect_spikes, remove_duplicates, extract_snippets)
@@ -51,7 +51,14 @@ except ImportError:
     HAS_CUDA = False
 
 STAGE_NAMES = ["A_detection", "B_clustering", "C_alignment", "D_postprocessing"]
-ALL_TARGETS = ["original_cpu", "torched_cpu", "torched_gpu", "optim_cpu", "optim_gpu"]
+ALL_TARGETS = ["original", "cpp_iso_cpu", "cpp_iso_gpu", "torch_iso_cpu", "torch_iso_gpu"]
+TARGET_LABELS = {
+    "original":      "Original MountainSort5",
+    "cpp_iso_cpu":   "PyTorched MountainSort5 with C++ isosplit6 (CPU)",
+    "cpp_iso_gpu":   "PyTorched MountainSort5 with C++ isosplit6 (GPU)",
+    "torch_iso_cpu": "PyTorched MountainSort5 with PyTorch isosplit6 (CPU)",
+    "torch_iso_gpu": "PyTorched MountainSort5 with PyTorch isosplit6 (GPU)",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +163,9 @@ def load_and_preprocess(cfg: BenchmarkConfig) -> Tuple[si.BaseRecording, np.ndar
 
 
 # ---------------------------------------------------------------------------
-# Runner:  Original CPU  (calls low-level NumPy functions directly)
+# Runner:  Original MountainSort5  (calls low-level NumPy functions directly)
 # ---------------------------------------------------------------------------
-def run_original_cpu(
+def run_original(
     traces_master: np.ndarray,
     channel_locations: np.ndarray,
     sampling_frequency: float,
@@ -273,7 +280,7 @@ def run_torched(
     sampling_frequency: float,
     params: ms5.Scheme1SortingParameters,
     device: str,
-    use_optim: bool = False,
+    use_torch_iso: bool = False,
 ) -> Tuple[RunTimings, np.ndarray, np.ndarray]:
     from torched_mountainsort5.schema import SortingBatch
     from torched_mountainsort5.mountainsort5 import MountainSort5
@@ -283,7 +290,7 @@ def run_torched(
     use_cuda_sync = dev.type == "cuda"
 
     torched_params = _make_torched_params(params)
-    model_cls = TorchIsosplit6MountainSort5 if use_optim else MountainSort5
+    model_cls = TorchIsosplit6MountainSort5 if use_torch_iso else MountainSort5
     model = model_cls(torched_params, sampling_frequency).to(dev)
 
     traces_t = torch.as_tensor(np.copy(traces_master), dtype=torch.float32, device=dev)
@@ -363,10 +370,10 @@ def run_target(
     all_labels: List[np.ndarray] = []
 
     # CUDA warm-up (one throw-away run)
-    if target in ("torched_gpu", "optim_gpu"):
-        use_optim = target == "optim_gpu"
+    if target in ("cpp_iso_gpu", "torch_iso_gpu"):
+        use_torch_iso = target == "torch_iso_gpu"
         print("  CUDA warm-up run ...")
-        run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda", use_optim=use_optim)
+        run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda", use_torch_iso=use_torch_iso)
         torch.cuda.empty_cache()
 
     for i in range(cfg.n_runs):
@@ -376,16 +383,16 @@ def run_target(
 
         print(f"  Run {i + 1}/{cfg.n_runs} ... ", end="", flush=True)
 
-        if target == "original_cpu":
-            timings, t_out, l_out = run_original_cpu(traces, channel_locations, sampling_frequency, cfg.scheme1_params)
-        elif target == "torched_cpu":
+        if target == "original":
+            timings, t_out, l_out = run_original(traces, channel_locations, sampling_frequency, cfg.scheme1_params)
+        elif target == "cpp_iso_cpu":
             timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu")
-        elif target == "torched_gpu":
+        elif target == "cpp_iso_gpu":
             timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda")
-        elif target == "optim_cpu":
-            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu", use_optim=True)
-        elif target == "optim_gpu":
-            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda", use_optim=True)
+        elif target == "torch_iso_cpu":
+            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu", use_torch_iso=True)
+        elif target == "torch_iso_gpu":
+            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda", use_torch_iso=True)
         else:
             raise ValueError(f"Unknown target: {target}")
 
@@ -403,14 +410,18 @@ def run_target(
 # Summary & Validation
 # ---------------------------------------------------------------------------
 def print_summary_table(results: Dict[str, List[RunTimings]]):
-    print("\n" + "=" * 90)
+    label_width = max((len(TARGET_LABELS[t]) for t in results), default=18)
+    label_width = max(label_width, len("Target"))
+    total_width = label_width + 2 + (16 * (len(STAGE_NAMES) + 1))
+
+    print("\n" + "=" * total_width)
     print("PERFORMANCE SUMMARY (seconds)")
-    print("=" * 90)
-    header = f"{'Target':<18}"
+    print("=" * total_width)
+    header = f"{'Target':<{label_width}}"
     for stage in STAGE_NAMES + ["Total"]:
         header += f"{'':>2}{stage:>14}"
     print(header)
-    print("-" * 90)
+    print("-" * total_width)
 
     for target, timings_list in results.items():
         if not timings_list:
@@ -423,30 +434,30 @@ def print_summary_table(results: Dict[str, List[RunTimings]]):
             vals["D_postprocessing"].append(t.D_postprocessing)
             vals["Total"].append(t.total)
 
-        row = f"{target:<18}"
+        row = f"{TARGET_LABELS[target]:<{label_width}}"
         for stage in STAGE_NAMES + ["Total"]:
             mean = np.mean(vals[stage])
             std = np.std(vals[stage])
             row += f"  {mean:>6.3f}+/-{std:<5.3f}"
         print(row)
 
-    print("=" * 90)
+    print("=" * total_width)
 
 
 def fidelity_check(
     results: Dict[str, Tuple[List[np.ndarray], List[np.ndarray]]],
 ):
-    """Port parity (original_cpu vs torched_gpu) and determinism (run 0 vs run n-1)."""
+    """Port parity (original vs each PyTorched variant) and determinism (run 0 vs run n-1)."""
     print("\n" + "=" * 90)
     print("FIDELITY CHECKS")
     print("=" * 90)
 
     # --- Port parity ---
     pairs = [
-        ("original_cpu", "torched_cpu"),
-        ("original_cpu", "torched_gpu"),
-        ("original_cpu", "optim_cpu"),
-        ("original_cpu", "optim_gpu"),
+        ("original", "cpp_iso_cpu"),
+        ("original", "cpp_iso_gpu"),
+        ("original", "torch_iso_cpu"),
+        ("original", "torch_iso_gpu"),
     ]
     for t1, t2 in pairs:
         if t1 not in results or t2 not in results:
@@ -457,28 +468,30 @@ def fidelity_check(
         times_match = np.array_equal(times_a, times_b)
         labels_match = np.array_equal(labels_a, labels_b)
 
+        label_pair = f"{TARGET_LABELS[t1]} vs {TARGET_LABELS[t2]}"
         if times_match and labels_match:
-            print(f"  {t1} vs {t2}:  IDENTICAL (times and labels)")
+            print(f"  {label_pair}:  IDENTICAL (times and labels)")
         else:
             common = np.intersect1d(times_a, times_b)
             frac = len(common) / max(len(times_a), 1)
-            print(f"  {t1} vs {t2}:  spikes={len(times_a)} vs {len(times_b)}, "
+            print(f"  {label_pair}:  spikes={len(times_a)} vs {len(times_b)}, "
                   f"shared_times={len(common)} ({frac:.4f}), labels_match={labels_match}")
 
     # --- Determinism (run 0 vs last run within each target) ---
     print()
     for target, (all_times, all_labels) in results.items():
+        label = TARGET_LABELS[target]
         if len(all_times) < 2:
-            print(f"  {target} determinism:  skipped (only 1 run)")
+            print(f"  {label} determinism:  skipped (only 1 run)")
             continue
         t0, t_last = all_times[0], all_times[-1]
         l0, l_last = all_labels[0], all_labels[-1]
         if np.array_equal(t0, t_last) and np.array_equal(l0, l_last):
-            print(f"  {target} determinism:  PASS (run 0 == run {len(all_times) - 1})")
+            print(f"  {label} determinism:  PASS (run 0 == run {len(all_times) - 1})")
         else:
             common = np.intersect1d(t0, t_last)
             frac = len(common) / max(len(t0), 1)
-            print(f"  {target} determinism:  DRIFT  shared_times={len(common)}/{len(t0)} ({frac:.4f})")
+            print(f"  {label} determinism:  DRIFT  shared_times={len(common)}/{len(t0)} ({frac:.4f})")
 
     print("=" * 90)
 
@@ -536,8 +549,8 @@ def main():
     cfg = parse_args()
 
     # Validate targets
-    gpu_targets = {"torched_gpu", "optim_gpu"}
-    torch_targets = {"torched_cpu", "torched_gpu", "optim_cpu", "optim_gpu"}
+    gpu_targets = {"cpp_iso_gpu", "torch_iso_gpu"}
+    torch_targets = {"cpp_iso_cpu", "cpp_iso_gpu", "torch_iso_cpu", "torch_iso_gpu"}
     if gpu_targets & set(cfg.targets) and not HAS_CUDA:
         print("WARNING: GPU targets requested but CUDA not available. Removing from targets.")
         cfg.targets = [t for t in cfg.targets if t not in gpu_targets]
@@ -558,8 +571,9 @@ def main():
     output_results: Dict[str, Tuple[List[np.ndarray], List[np.ndarray]]] = {}
 
     for target in cfg.targets:
+        label = TARGET_LABELS[target]
         print(f"\n{'=' * 60}")
-        print(f"  TARGET: {target}  ({cfg.n_runs} runs)")
+        print(f"  TARGET: {label}  [{target}]  ({cfg.n_runs} runs)")
         print(f"{'=' * 60}")
 
         if target in torch_targets:
