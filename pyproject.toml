@@ -1,34 +1,62 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "torched-mountainsort5"
 version = "0.1.0"
-description = "GPU-accelerated MountainSort5 spike sorting pipeline built on PyTorch"
-requires-python = ">=3.9"
+description = "A dual-backend implementation of Mountainsort5 using PyTorch for high-performance spike sorting."
+readme = "README.md"
+# Compatibility window: SpikeInterface requires >=3.10, legacy isosplit6 C++ extensions capped at 3.11.
+requires-python = ">=3.10, <3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["neuroscience", "spike-sorting", "pytorch", "mountainsort5"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+# Core dependencies (Machine-agnostic scientific and neuroinformatics stack)
 dependencies = [
-    "torch>=2.0",
+    "numpy>=2.0.0",
+    "scipy>=1.10.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "scikit-learn>=1.2.0",
+    "spikeinterface>=0.103.2",
+    "neo>=0.14.0",
+    "probeinterface>=0.3.1",
+    "numba>=0.58.0",
+    "zarr>=2.16.0",
+    "tqdm>=4.66.0",
+    "isosplit6>=0.1.4",  # Original C++ implementation
+    # External Git Repositories
+    "isosplit6_torch @ git+https://github.com/juwaynilucman/torched-isosplit6.git",
+    "mountainsort5 @ git+https://github.com/juwaynilucman/mountainsort5.git",
 ]
 
 [project.optional-dependencies]
-spikeinterface = [
-    "spikeinterface",
+# Hardware-agnostic GPU support
+gpu = [
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+    "torchaudio>=2.4.0",
 ]
-benchmark = [
-    "spikeinterface",
-    "mountainsort5",
-    "scipy",
-    "probeinterface",
-]
-test = [
-    "pytest",
-    "spikeinterface",
-    "mountainsort5",
+# Development and testing tools
+dev = [
+    "pytest>=8.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["torched_mountainsort5*"]
+[tool.setuptools]
+packages = {find = {}}
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.black]
+line-length = 88
+target-version = ['py310', 'py311']
