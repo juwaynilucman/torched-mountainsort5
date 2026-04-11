@@ -69,7 +69,7 @@ class BenchmarkConfig:
     sampling_freq: int = 30000
     num_channels: int = 384
     dtype: str = "int16"
-    npx_bin_path: Path = Path(r"C:\Users\juway\Documents\Marquees-smith\c46\subset_data\raw_2pct.bin")
+    npx_bin_path: Path = Path(r"C:\Users\juway\Documents\Marquees-smith\c46\subset_data\raw_1pct.bin")
     chan_map_path: Path = Path(r"D:\chanMap.mat")
     results_dir: Path = Path("results")
     n_runs: int = 3
@@ -141,7 +141,7 @@ def load_and_preprocess(cfg: BenchmarkConfig) -> Tuple[si.BaseRecording, np.ndar
     # --- NEW: Slice the recording for development ---
     # Example 1: Grab the first 32 channels
     chan_range = range(155, 167)  # 155:167
-    channels_to_keep = recording.get_channel_ids()[chan_range]   # Adjust this range as needed for testing
+    channels_to_keep = recording.get_channel_ids()[:]   # Adjust this range as needed for testing
     
     # Example 2: Grab specific channel IDs (if you know where a good unit is)
     # channels_to_keep = [10, 11, 12, 13, 14, 15] 
@@ -589,6 +589,17 @@ def main():
     print_summary_table(timing_results)
     fidelity_check(output_results)
     save_json_report(cfg, timing_results)
+
+    # --- Plot ---
+    try:
+        from plotting.stacked_runtime_bar import plot_stacked_runtime
+        plot_stacked_runtime(
+            timing_results,
+            TARGET_LABELS,
+            cfg.results_dir / "benchmark_runtime.pdf",
+        )
+    except ImportError as e:
+        print(f"Skipping runtime plot (matplotlib not available): {e}")
 
 
 if __name__ == "__main__":
