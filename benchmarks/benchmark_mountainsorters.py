@@ -24,6 +24,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import psutil
+
+try:
+    from threadpoolctl import threadpool_info
+    HAS_THREADPOOLCTL = True
+except ImportError:
+    HAS_THREADPOOLCTL = False
 import scipy.io as sio
 import spikeinterface.core as si
 import spikeinterface.preprocessing as spre
@@ -83,18 +90,45 @@ class BenchmarkConfig:
 
 
 # ---------------------------------------------------------------------------
-# Timer helpers
+# Resource & timer helpers
 # ---------------------------------------------------------------------------
-class StageTimer:
-    """Context-manager timer with optional CUDA synchronisation."""
+@dataclass
+class StageResources:
+    """Resource usage observed during a single stage."""
+    rss_before_mb: float = 0.0
+    rss_after_mb: float = 0.0
+    cpu_percent: float = 0.0
+    process_threads: int = 0
+    torch_threads: Optional[int] = None
+    torch_interop_threads: Optional[int] = None
+    blas_info: Optional[List[dict]] = None
+    gpu_allocated_mb: float = 0.0
+    gpu_reserved_mb: float = 0.0
+
+    @property
+    def rss_delta_mb(self) -> float:
+        return self.rss_after_mb - self.rss_before_mb
+
+
+class StageMonitor:
+    """Context-manager that captures wall time AND resource usage per stage."""
 
     def __init__(self, use_cuda_sync: bool = False):
         self.use_cuda_sync = use_cuda_sync
         self.elapsed: float = 0.0
+        self.resources = StageResources()
 
     def __enter__(self):
+        proc = psutil.Process()
+        self.resources.rss_before_mb = proc.memory_info().rss / 1e6
+        # Prime cpu_percent measurement (first call returns 0.0)
+        proc.cpu_percent()
+        self._proc = proc
+
         if self.use_cuda_sync:
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
         self._start = time.perf_counter()
         return self
 
@@ -102,6 +136,25 @@ class StageTimer:
         if self.use_cuda_sync:
             torch.cuda.synchronize()
         self.elapsed = time.perf_counter() - self._start
+
+        proc = self._proc
+        self.resources.rss_after_mb = proc.memory_info().rss / 1e6
+        self.resources.cpu_percent = proc.cpu_percent()
+        self.resources.process_threads = proc.num_threads()
+
+        if HAS_TORCH:
+            self.resources.torch_threads = torch.get_num_threads()
+            self.resources.torch_interop_threads = torch.get_num_interop_threads()
+
+        if HAS_THREADPOOLCTL:
+            self.resources.blas_info = [
+                {"library": p["internal_api"], "num_threads": p["num_threads"]}
+                for p in threadpool_info()
+            ]
+
+        if self.use_cuda_sync:
+            self.resources.gpu_allocated_mb = torch.cuda.max_memory_allocated() / 1e6
+            self.resources.gpu_reserved_mb = torch.cuda.max_memory_reserved() / 1e6
 
 
 @dataclass
@@ -114,6 +167,14 @@ class RunTimings:
     @property
     def total(self) -> float:
         return self.A_detection + self.B_clustering + self.C_alignment + self.D_postprocessing
+
+
+@dataclass
+class RunResources:
+    A_detection: StageResources = field(default_factory=StageResources)
+    B_clustering: StageResources = field(default_factory=StageResources)
+    C_alignment: StageResources = field(default_factory=StageResources)
+    D_postprocessing: StageResources = field(default_factory=StageResources)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +202,7 @@ def load_and_preprocess(cfg: BenchmarkConfig) -> Tuple[si.BaseRecording, np.ndar
     # --- NEW: Slice the recording for development ---
     # Example 1: Grab the first 32 channels
     chan_range = range(155, 167)  # 155:167
-    channels_to_keep = recording.get_channel_ids()[:]   # Adjust this range as needed for testing
+    channels_to_keep = recording.get_channel_ids()[chan_range]   # Adjust this range as needed for testing
     
     # Example 2: Grab specific channel IDs (if you know where a good unit is)
     # channels_to_keep = [10, 11, 12, 13, 14, 15] 
@@ -170,16 +231,17 @@ def run_original(
     channel_locations: np.ndarray,
     sampling_frequency: float,
     params: ms5.Scheme1SortingParameters,
-) -> Tuple[RunTimings, np.ndarray, np.ndarray]:
+) -> Tuple[RunTimings, RunResources, np.ndarray, np.ndarray]:
     traces = np.copy(traces_master)
     N, M = traces.shape
     timings = RunTimings()
+    resources = RunResources()
     time_radius = int(math.ceil(params.detect_time_radius_msec / 1000 * sampling_frequency))
     npca = params.npca_per_channel * M
 
     # --- Stage A: Detection & Extraction ---
-    t = StageTimer()
-    with t:
+    m = StageMonitor()
+    with m:
         times, channel_indices = detect_spikes(
             traces=traces,
             channel_locations=channel_locations,
@@ -201,22 +263,24 @@ def run_original(
             T1=params.snippet_T1,
             T2=params.snippet_T2,
         )
-    timings.A_detection = t.elapsed
+    timings.A_detection = m.elapsed
+    resources.A_detection = m.resources
     L, T = snippets.shape[0], snippets.shape[1]
 
     # --- Stage B: Clustering (1st pass) ---
-    t = StageTimer()
-    with t:
+    m = StageMonitor()
+    with m:
         features = compute_pca_features(snippets.reshape((L, T * M)), npca=npca)
         labels = isosplit6_subdivision_method(X=features, npca_per_subdivision=params.npca_per_subdivision)
         K = int(np.max(labels)) if len(labels) > 0 else 0
         templates_ = compute_templates(snippets=snippets, labels=labels)
         peak_channel_indices = [int(np.argmin(np.min(templates_[i], axis=0))) for i in range(K)]
-    timings.B_clustering = t.elapsed
+    timings.B_clustering = m.elapsed
+    resources.B_clustering = m.resources
 
     # --- Stage C: Alignment & Re-Clustering ---
-    t = StageTimer()
-    with t:
+    m = StageMonitor()
+    with m:
         if not params.skip_alignment:
             offsets_ = align_templates(templates_)
             snippets = align_snippets(snippets, offsets_, labels)
@@ -231,11 +295,12 @@ def run_original(
 
             offsets_to_peak = determine_offsets_to_peak(templates_, detect_sign=params.detect_sign, T1=params.snippet_T1)
             times = offset_times(times, offsets_to_peak, labels)
-    timings.C_alignment = t.elapsed
+    timings.C_alignment = m.elapsed
+    resources.C_alignment = m.resources
 
     # --- Stage D: Post-processing ---
-    t = StageTimer()
-    with t:
+    m = StageMonitor()
+    with m:
         sort_inds = np.argsort(times, kind="stable")
         times = times[sort_inds]
         labels = labels[sort_inds]
@@ -250,9 +315,10 @@ def run_original(
                 aa[k - 1] = np.inf
         new_labels_map = np.argsort(np.argsort(aa, kind="stable"), kind="stable") + 1
         labels = new_labels_map[labels - 1]
-    timings.D_postprocessing = t.elapsed
+    timings.D_postprocessing = m.elapsed
+    resources.D_postprocessing = m.resources
 
-    return timings, np.asarray(times), np.asarray(labels)
+    return timings, resources, np.asarray(times), np.asarray(labels)
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +347,7 @@ def run_torched(
     params: ms5.Scheme1SortingParameters,
     device: str,
     use_torch_iso: bool = False,
-) -> Tuple[RunTimings, np.ndarray, np.ndarray]:
+) -> Tuple[RunTimings, RunResources, np.ndarray, np.ndarray]:
     from torched_mountainsort5.schema import SortingBatch
     from torched_mountainsort5.mountainsort5 import MountainSort5
     from torched_mountainsort5.torch_clustering_mountainsort5 import TorchIsosplit6MountainSort5
@@ -303,26 +369,29 @@ def run_torched(
     )
 
     timings = RunTimings()
+    resources = RunResources()
 
     # --- Stage A: Detection & Extraction ---
-    t = StageTimer(use_cuda_sync)
-    with t:
+    m = StageMonitor(use_cuda_sync)
+    with m:
         batch = model.detect_spikes(batch)
         batch = model.remove_duplicates(batch)
         batch = model.extract_snippets(batch)
-    timings.A_detection = t.elapsed
+    timings.A_detection = m.elapsed
+    resources.A_detection = m.resources
 
     # --- Stage B: Clustering (1st pass) ---
-    t = StageTimer(use_cuda_sync)
-    with t:
+    m = StageMonitor(use_cuda_sync)
+    with m:
         batch = model.compute_pca(batch)
         batch = model.clustering(batch)
         batch = model.compute_templates(batch)
-    timings.B_clustering = t.elapsed
+    timings.B_clustering = m.elapsed
+    resources.B_clustering = m.resources
 
     # --- Stage C: Alignment & Re-Clustering ---
-    t = StageTimer(use_cuda_sync)
-    with t:
+    m = StageMonitor(use_cuda_sync)
+    with m:
         if not torched_params.skip_alignment:
             batch = model.align_templates(batch)
             batch = model.align_snippets(batch)
@@ -333,19 +402,21 @@ def run_torched(
             batch = model.compute_templates(batch)
 
             batch = model.offset_times_to_peak(batch)
-    timings.C_alignment = t.elapsed
+    timings.C_alignment = m.elapsed
+    resources.C_alignment = m.resources
 
     # --- Stage D: Post-processing ---
-    t = StageTimer(use_cuda_sync)
-    with t:
+    m = StageMonitor(use_cuda_sync)
+    with m:
         batch = model.sort_times(batch)
         batch = model.remove_out_of_bounds(batch)
         batch = model.reorder_units(batch)
-    timings.D_postprocessing = t.elapsed
+    timings.D_postprocessing = m.elapsed
+    resources.D_postprocessing = m.resources
 
     out_times = batch.times.cpu().numpy()
     out_labels = batch.labels.cpu().numpy()
-    return timings, out_times, out_labels
+    return timings, resources, out_times, out_labels
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +435,9 @@ def run_target(
     traces: np.ndarray,
     channel_locations: np.ndarray,
     sampling_frequency: float,
-) -> Tuple[List[RunTimings], List[np.ndarray], List[np.ndarray]]:
+) -> Tuple[List[RunTimings], List[RunResources], List[np.ndarray], List[np.ndarray]]:
     all_timings: List[RunTimings] = []
+    all_resources: List[RunResources] = []
     all_times: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
 
@@ -384,15 +456,15 @@ def run_target(
         print(f"  Run {i + 1}/{cfg.n_runs} ... ", end="", flush=True)
 
         if target == "original":
-            timings, t_out, l_out = run_original(traces, channel_locations, sampling_frequency, cfg.scheme1_params)
+            timings, res, t_out, l_out = run_original(traces, channel_locations, sampling_frequency, cfg.scheme1_params)
         elif target == "cpp_iso_cpu":
-            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu")
+            timings, res, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu")
         elif target == "cpp_iso_gpu":
-            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda")
+            timings, res, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda")
         elif target == "torch_iso_cpu":
-            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu", use_torch_iso=True)
+            timings, res, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cpu", use_torch_iso=True)
         elif target == "torch_iso_gpu":
-            timings, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda", use_torch_iso=True)
+            timings, res, t_out, l_out = run_torched(traces, channel_locations, sampling_frequency, cfg.scheme1_params, "cuda", use_torch_iso=True)
         else:
             raise ValueError(f"Unknown target: {target}")
 
@@ -400,10 +472,11 @@ def run_target(
 
         save_outputs(cfg.results_dir, target, i, t_out, l_out)
         all_timings.append(timings)
+        all_resources.append(res)
         all_times.append(t_out)
         all_labels.append(l_out)
 
-    return all_timings, all_times, all_labels
+    return all_timings, all_resources, all_times, all_labels
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +515,55 @@ def print_summary_table(results: Dict[str, List[RunTimings]]):
         print(row)
 
     print("=" * total_width)
+
+
+def print_resource_table(results: Dict[str, List[RunResources]]):
+    """Print per-target resource usage: threads, CPU%, RSS, and GPU memory."""
+    print("\n" + "=" * 120)
+    print("RESOURCE USAGE (per stage, averaged over runs)")
+    print("=" * 120)
+
+    for target, resources_list in results.items():
+        if not resources_list:
+            continue
+        label = TARGET_LABELS[target]
+        print(f"\n  {label}")
+        print(f"  {'Stage':<20} {'CPU%':>7} {'Threads':>8} {'Torch Thr':>10} {'BLAS Thr':>9} {'RSS Δ MB':>9} {'GPU Alloc MB':>13} {'GPU Resv MB':>12}")
+        print(f"  {'-' * 100}")
+
+        for stage in STAGE_NAMES:
+            cpu_pcts, n_threads, torch_thr, blas_thr = [], [], [], []
+            rss_deltas, gpu_allocs, gpu_resvs = [], [], []
+
+            for res in resources_list:
+                sr: StageResources = getattr(res, stage)
+                cpu_pcts.append(sr.cpu_percent)
+                n_threads.append(sr.process_threads)
+                torch_thr.append(sr.torch_threads if sr.torch_threads is not None else 0)
+                rss_deltas.append(sr.rss_delta_mb)
+                gpu_allocs.append(sr.gpu_allocated_mb)
+                gpu_resvs.append(sr.gpu_reserved_mb)
+
+                if sr.blas_info:
+                    blas_thr.append(max(p["num_threads"] for p in sr.blas_info))
+                else:
+                    blas_thr.append(0)
+
+            row = f"  {stage:<20}"
+            row += f" {np.mean(cpu_pcts):>6.1f}%"
+            row += f" {int(np.mean(n_threads)):>8}"
+            row += f" {int(np.mean(torch_thr)):>10}"
+            row += f" {int(np.mean(blas_thr)):>9}"
+            row += f" {np.mean(rss_deltas):>+9.1f}"
+            if any(v > 0 for v in gpu_allocs):
+                row += f" {np.mean(gpu_allocs):>13.1f}"
+                row += f" {np.mean(gpu_resvs):>12.1f}"
+            else:
+                row += f" {'n/a':>13}"
+                row += f" {'n/a':>12}"
+            print(row)
+
+    print("\n" + "=" * 120)
 
 
 def fidelity_check(
@@ -496,21 +618,49 @@ def fidelity_check(
     print("=" * 90)
 
 
+def _stage_resources_to_dict(sr: StageResources) -> dict:
+    d = {
+        "rss_before_mb": round(sr.rss_before_mb, 1),
+        "rss_after_mb": round(sr.rss_after_mb, 1),
+        "rss_delta_mb": round(sr.rss_delta_mb, 1),
+        "cpu_percent": round(sr.cpu_percent, 1),
+        "process_threads": sr.process_threads,
+    }
+    if sr.torch_threads is not None:
+        d["torch_threads"] = sr.torch_threads
+        d["torch_interop_threads"] = sr.torch_interop_threads
+    if sr.blas_info:
+        d["blas_info"] = sr.blas_info
+    if sr.gpu_allocated_mb > 0:
+        d["gpu_allocated_mb"] = round(sr.gpu_allocated_mb, 1)
+        d["gpu_reserved_mb"] = round(sr.gpu_reserved_mb, 1)
+    return d
+
+
 def save_json_report(
     cfg: BenchmarkConfig,
     timing_results: Dict[str, List[RunTimings]],
+    resource_results: Dict[str, List[RunResources]],
 ):
     report = {"n_runs": cfg.n_runs, "targets": {}}
     for target, timings_list in timing_results.items():
+        resources_list = resource_results.get(target, [])
         runs = []
-        for t in timings_list:
-            runs.append({
+        for i, t in enumerate(timings_list):
+            run_entry = {
                 "A_detection": t.A_detection,
                 "B_clustering": t.B_clustering,
                 "C_alignment": t.C_alignment,
                 "D_postprocessing": t.D_postprocessing,
                 "total": t.total,
-            })
+            }
+            if i < len(resources_list):
+                res = resources_list[i]
+                run_entry["resources"] = {
+                    stage: _stage_resources_to_dict(getattr(res, stage))
+                    for stage in STAGE_NAMES
+                }
+            runs.append(run_entry)
         report["targets"][target] = runs
     out_path = cfg.results_dir / "benchmark_report.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -568,6 +718,7 @@ def main():
 
     # --- Run each target ---
     timing_results: Dict[str, List[RunTimings]] = {}
+    resource_results: Dict[str, List[RunResources]] = {}
     output_results: Dict[str, Tuple[List[np.ndarray], List[np.ndarray]]] = {}
 
     for target in cfg.targets:
@@ -579,16 +730,18 @@ def main():
         if target in torch_targets:
             torch.cuda.empty_cache() if HAS_CUDA else None
 
-        timings, all_times, all_labels = run_target(
+        timings, resources, all_times, all_labels = run_target(
             target, cfg, traces_master, channel_locations, sampling_frequency,
         )
         timing_results[target] = timings
+        resource_results[target] = resources
         output_results[target] = (all_times, all_labels)
 
     # --- Report ---
     print_summary_table(timing_results)
+    print_resource_table(resource_results)
     fidelity_check(output_results)
-    save_json_report(cfg, timing_results)
+    save_json_report(cfg, timing_results, resource_results)
 
     # --- Plot ---
     try:
